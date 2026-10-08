@@ -1,0 +1,10 @@
+Metric,Value
+Dataset Rows,10000.0
+Dataset Columns,10.0
+Duplicate Rows,0.0
+Train Test Overlap,0.0
+Random Forest Accuracy,0.999
+Random Forest Precision,1.0
+Random Forest Recall,0.9939759036144579
+Random Forest F1,0.9969788519637462
+Random Forest ROC AUC,1.0
