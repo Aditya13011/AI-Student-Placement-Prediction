@@ -1,10 +1,13 @@
 
 import streamlit as st
 import pandas as pd
-import joblib
+import numpy as np
 import plotly.express as px
+import plotly.graph_objects as go
+
 from pathlib import Path
 from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (
     accuracy_score,
     precision_score,
@@ -13,224 +16,319 @@ from sklearn.metrics import (
     confusion_matrix,
     classification_report
 )
-from sklearn.preprocessing import LabelEncoder
 
 st.set_page_config(
     page_title="Model Analytics",
-    page_icon="🤖",
+    page_icon="📈",
     layout="wide"
 )
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_PATH = BASE_DIR / "college_student_placement_dataset.csv"
-MODEL_PATH = BASE_DIR / "final_random_forest_model.pkl"
 
-st.title("🤖 Machine Learning Model Analytics")
-st.caption("Evaluate model performance and understand important features.")
-st.divider()
+FEATURES = [
+    "IQ",
+    "Prev_Sem_Result",
+    "CGPA",
+    "Academic_Performance",
+    "Internship_Experience",
+    "Extra_Curricular_Score",
+    "Communication_Skills",
+    "Projects_Completed"
+]
+TARGET = "Placement"
+
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
+html, body, [class*="css"] {
+    font-family: 'Inter', sans-serif;
+}
+.stApp {
+    background: linear-gradient(135deg, #080d1b, #10172b);
+    color: #eef2ff;
+}
+.block-container {
+    max-width: 1400px;
+    padding-top: 2rem;
+    padding-bottom: 3rem;
+}
+[data-testid="stSidebar"] {
+    background: #0b1020;
+    border-right: 1px solid #293653;
+}
+h1, h2, h3 {
+    color: #f1f5ff !important;
+}
+[data-testid="stMetric"] {
+    background: #151e33;
+    border: 1px solid #293653;
+    border-radius: 16px;
+    padding: 18px;
+}
+[data-testid="stMetricValue"] {
+    color: #8b9cff;
+}
+.analytics-hero {
+    background: linear-gradient(120deg, #182443, #25204a);
+    border: 1px solid #35436b;
+    padding: 28px 32px;
+    border-radius: 22px;
+    margin-bottom: 24px;
+}
+.analytics-hero h1 {
+    font-size: 32px;
+    font-weight: 800;
+    margin: 0;
+}
+.analytics-hero p {
+    color: #b8c5e2;
+    margin-bottom: 0;
+}
+.small-note {
+    color: #aab8d3;
+    font-size: 13px;
+}
+div[data-testid="stDataFrame"] {
+    border: 1px solid #293653;
+    border-radius: 12px;
+}
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown("""
+<div class="analytics-hero">
+    <h1>📈 Model Analytics</h1>
+    <p>Evaluate classification performance and understand which features influence the model.</p>
+</div>
+""", unsafe_allow_html=True)
+
+st.warning(
+    "The metrics below are calculated from a newly trained Random Forest model "
+    "using a hold-out test split. They do not automatically describe the exact "
+    "performance of final_random_forest_model.pkl used on the prediction pages."
+)
+
+if not DATA_PATH.exists():
+    st.error(f"Dataset not found: {DATA_PATH}")
+    st.stop()
 
 
 @st.cache_data
-def load_dataset(path):
+def load_data(path):
     return pd.read_csv(path)
 
 
 try:
-    df = load_dataset(DATA_PATH)
-except Exception as error:
-    st.error(f"Could not load dataset: {error}")
+    df = load_data(str(DATA_PATH))
+except Exception as exc:
+    st.error(f"Could not load dataset: {exc}")
     st.stop()
 
-if "Placement" not in df.columns:
-    st.error("The dataset must contain a Placement column.")
+missing = [col for col in FEATURES + [TARGET] if col not in df.columns]
+if missing:
+    st.error("Missing required columns: " + ", ".join(missing))
     st.stop()
 
-# Keep only valid target records.
-df["Placement"] = (
-    df["Placement"].astype(str).str.strip().str.title()
-)
-df = df[df["Placement"].isin(["Yes", "No"])].copy()
+df = df[FEATURES + [TARGET]].copy()
 
-if df.empty:
-    st.error("No valid placement labels were found.")
+# Normalize common Yes/No and boolean encodings.
+internship_map = {
+    "yes": 1, "no": 0, "true": 1, "false": 0,
+    "1": 1, "0": 0, "1.0": 1, "0.0": 0
+}
+df["Internship_Experience"] = (
+    df["Internship_Experience"]
+    .astype(str).str.strip().str.lower()
+    .map(internship_map)
+)
+
+for col in FEATURES:
+    df[col] = pd.to_numeric(df[col], errors="coerce")
+
+# Support common binary target representations.
+target_text = df[TARGET].astype(str).str.strip().str.lower()
+target_map = {
+    "yes": 1, "placed": 1, "true": 1, "1": 1, "1.0": 1,
+    "no": 0, "not placed": 0, "false": 0, "0": 0, "0.0": 0
+}
+df[TARGET] = target_text.map(target_map)
+
+before = len(df)
+df = df.dropna(subset=FEATURES + [TARGET]).copy()
+df[TARGET] = df[TARGET].astype(int)
+dropped = before - len(df)
+
+if dropped:
+    st.info(f"{dropped} row(s) were excluded because required values were missing or invalid.")
+
+if len(df) < 20:
+    st.error("At least 20 valid rows are required for this evaluation.")
     st.stop()
 
-# Remove identifiers and target from the predictors.
-# College_ID is an identifier, not a student performance feature.
-X = df.drop(
-    columns=["Placement", "College_ID"],
-    errors="ignore"
-).copy()
-
-y = df["Placement"].map({"No": 0, "Yes": 1})
-
-# Convert categorical columns into numeric columns.
-for column in X.select_dtypes(include=["object", "string"]).columns:
-    X[column] = LabelEncoder().fit_transform(
-        X[column].fillna("Missing").astype(str)
-    )
-
-X = X.apply(pd.to_numeric, errors="coerce")
-X = X.replace([float("inf"), float("-inf")], float("nan"))
-
-# Remove columns that are entirely missing.
-X = X.dropna(axis=1, how="all")
-
-# Median-impute remaining missing feature values.
-X = X.fillna(X.median()).fillna(0)
-
-if X.empty:
-    st.error("No usable predictor columns remain.")
+if df[TARGET].nunique() < 2:
+    st.error("The target column must contain both placement classes.")
     st.stop()
 
-# Create a reproducible holdout split.
-X_train, X_test, y_train, y_test = train_test_split(
-    X,
-    y,
-    test_size=0.20,
-    random_state=42,
-    stratify=y
+st.sidebar.header("Evaluation Settings")
+test_size_percent = st.sidebar.slider(
+    "Test set (%)",
+    min_value=15,
+    max_value=40,
+    value=20,
+    step=5
+)
+n_estimators = st.sidebar.slider(
+    "Number of trees",
+    min_value=50,
+    max_value=300,
+    value=100,
+    step=50
+)
+random_state = st.sidebar.number_input(
+    "Random seed",
+    min_value=0,
+    max_value=10000,
+    value=42,
+    step=1
 )
 
-st.subheader("Evaluation setup")
-st.write(
-    f"Dataset: **{len(df):,} rows** | "
-    f"Training rows: **{len(X_train):,}** | "
-    f"Test rows: **{len(X_test):,}**"
-)
+X = df[FEATURES]
+y = df[TARGET]
 
-st.warning(
-    "This page trains a fresh Random Forest on a holdout split. "
-    "It does not assume the saved model was trained using the same "
-    "preprocessing. Treat results as diagnostic until the training "
-    "and inference pipeline is standardized."
-)
-
-from sklearn.ensemble import RandomForestClassifier
-
-model = RandomForestClassifier(
-    n_estimators=200,
-    random_state=42,
-    class_weight="balanced",
-    n_jobs=-1
-)
+class_counts = y.value_counts()
+can_stratify = class_counts.min() >= 2
 
 try:
+    X_train, X_test, y_train, y_test = train_test_split(
+        X,
+        y,
+        test_size=test_size_percent / 100,
+        random_state=int(random_state),
+        stratify=y if can_stratify else None
+    )
+
+    model = RandomForestClassifier(
+        n_estimators=n_estimators,
+        random_state=int(random_state),
+        class_weight="balanced",
+        n_jobs=-1
+    )
     model.fit(X_train, y_train)
-    predictions = model.predict(X_test)
+    y_pred = model.predict(X_test)
 
-    accuracy = accuracy_score(y_test, predictions)
-    precision = precision_score(
-        y_test, predictions, zero_division=0
-    )
-    recall = recall_score(
-        y_test, predictions, zero_division=0
-    )
-    f1 = f1_score(
-        y_test, predictions, zero_division=0
-    )
-
-except Exception as error:
-    st.error(f"Model evaluation failed: {error}")
+except Exception as exc:
+    st.error(f"Model evaluation failed: {exc}")
     st.stop()
 
-st.subheader("Performance metrics")
+accuracy = accuracy_score(y_test, y_pred)
+precision = precision_score(y_test, y_pred, zero_division=0)
+recall = recall_score(y_test, y_pred, zero_division=0)
+f1 = f1_score(y_test, y_pred, zero_division=0)
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Accuracy", f"{accuracy * 100:.2f}%")
-c2.metric("Precision", f"{precision * 100:.2f}%")
-c3.metric("Recall", f"{recall * 100:.2f}%")
-c4.metric("F1-score", f"{f1 * 100:.2f}%")
+st.subheader("Test Set Performance")
+
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Accuracy", f"{accuracy * 100:.2f}%")
+m2.metric("Precision", f"{precision * 100:.2f}%")
+m3.metric("Recall", f"{recall * 100:.2f}%")
+m4.metric("F1 Score", f"{f1 * 100:.2f}%")
 
 st.caption(
-    "Accuracy is the overall fraction of correct predictions. "
-    "Precision and recall focus on the positive (Placed) class. "
-    "F1-score balances precision and recall."
+    f"Training rows: {len(X_train):,} · Test rows: {len(X_test):,} · "
+    f"Random seed: {int(random_state)}"
 )
+
+st.divider()
 
 left, right = st.columns(2)
 
 with left:
-    st.subheader("Confusion matrix")
+    st.subheader("Confusion Matrix")
+    cm = confusion_matrix(y_test, y_pred, labels=[0, 1])
 
-    cm = confusion_matrix(
-        y_test, predictions, labels=[0, 1]
+    fig = go.Figure(data=go.Heatmap(
+        z=cm,
+        x=["Predicted Not Placed", "Predicted Placed"],
+        y=["Actual Not Placed", "Actual Placed"],
+        text=cm,
+        texttemplate="%{text}",
+        colorscale=[
+            [0, "#151e33"],
+            [0.5, "#5367c5"],
+            [1, "#8b9cff"]
+        ],
+        showscale=False
+    ))
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font_color="#e7edff",
+        xaxis_title="Predicted Class",
+        yaxis_title="Actual Class",
+        margin=dict(t=25, b=20, l=10, r=10)
     )
-
-    cm_df = pd.DataFrame(
-        cm,
-        index=["Actual Not Placed", "Actual Placed"],
-        columns=["Predicted Not Placed", "Predicted Placed"]
-    )
-
-    fig = px.imshow(
-        cm_df,
-        text_auto=True,
-        aspect="auto",
-        title="Actual vs Predicted"
-    )
-
     st.plotly_chart(fig, use_container_width=True)
 
 with right:
-    st.subheader("Classification report")
+    st.subheader("Feature Importance")
+    importance = pd.DataFrame({
+        "Feature": FEATURES,
+        "Importance": model.feature_importances_
+    }).sort_values("Importance", ascending=True)
 
-    report = classification_report(
-        y_test,
-        predictions,
-        labels=[0, 1],
-        target_names=["Not Placed", "Placed"],
-        output_dict=True,
-        zero_division=0
+    fig = px.bar(
+        importance,
+        x="Importance",
+        y="Feature",
+        orientation="h",
+        text=importance["Importance"].map(lambda x: f"{x:.3f}")
     )
-
-    report_df = pd.DataFrame(report).transpose()
-    st.dataframe(
-        report_df.round(3),
-        use_container_width=True
+    fig.update_traces(
+        marker_color="#7c8cff",
+        textposition="outside",
+        cliponaxis=False
     )
-
-st.subheader("Feature importance")
-
-importance_df = pd.DataFrame({
-    "Feature": X.columns,
-    "Importance": model.feature_importances_
-}).sort_values("Importance", ascending=False)
-
-fig = px.bar(
-    importance_df,
-    x="Importance",
-    y="Feature",
-    orientation="h",
-    title="Random Forest Feature Importance"
-)
-fig.update_layout(yaxis={"categoryorder": "total ascending"})
-st.plotly_chart(fig, use_container_width=True)
-
-st.dataframe(
-    importance_df.round(4),
-    use_container_width=True,
-    hide_index=True
-)
-
-with st.expander("View test predictions"):
-    results = pd.DataFrame({
-        "Actual": y_test.map({0: "No", 1: "Yes"}),
-        "Predicted": pd.Series(
-            predictions, index=y_test.index
-        ).map({0: "No", 1: "Yes"})
-    })
-
-    st.dataframe(results, use_container_width=True)
-
-    st.download_button(
-        "Download test predictions",
-        data=results.to_csv(index=True).encode("utf-8"),
-        file_name="model_test_predictions.csv",
-        mime="text/csv"
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font_color="#e7edff",
+        xaxis_title="Relative Importance",
+        yaxis_title="",
+        margin=dict(t=20, b=20, l=10, r=40)
     )
+    fig.update_xaxes(gridcolor="#283550")
+    st.plotly_chart(fig, use_container_width=True)
 
 st.divider()
-st.caption(
-    "Student Placement Intelligence System | Model Analytics"
+st.subheader("Classification Report")
+
+report = classification_report(
+    y_test,
+    y_pred,
+    labels=[0, 1],
+    target_names=["Not Placed", "Placed"],
+    output_dict=True,
+    zero_division=0
+)
+
+report_df = pd.DataFrame(report).transpose()
+st.dataframe(
+    report_df.round(3),
+    use_container_width=True
+)
+
+report_csv = report_df.to_csv().encode("utf-8")
+st.download_button(
+    "⬇️ Download Classification Report",
+    data=report_csv,
+    file_name="model_classification_report.csv",
+    mime="text/csv"
+)
+
+st.markdown("---")
+st.markdown(
+    '<p class="small-note">Model Analytics · Test results depend on the dataset, split, preprocessing, and model configuration. Feature importance indicates model reliance, not causation.</p>',
+    unsafe_allow_html=True
 )
